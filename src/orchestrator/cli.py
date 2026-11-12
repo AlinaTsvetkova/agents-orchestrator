@@ -11,8 +11,10 @@ from orchestrator.adapters import build_adapter, run_with_trace
 from orchestrator.state_machine import (
     STEP_SEQUENCE,
     TRACED_STEPS,
+    OverrideError,
     RunState,
     advance,
+    apply_human_override,
     load_state,
     record_human_plan_approval,
     record_sub_agent_output,
@@ -94,6 +96,27 @@ def cmd_resume(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_override(args: argparse.Namespace) -> int:
+    runs_dir = Path(args.runs_dir) if args.runs_dir else _default_runs_dir()
+    state = load_state(args.run_id, runs_dir)
+    try:
+        record = apply_human_override(
+            state,
+            step=args.step,
+            reason=args.reason,
+            operator=args.operator,
+        )
+    except OverrideError as error:
+        print(f"override rejected: {error}", file=sys.stderr)
+        return 1
+    save_state(state, runs_dir)
+    print(
+        f"override applied: run={state.run_id} step={record['step']} "
+        f"operator={record['operator'] or '<unset>'} at {record['applied_at']}"
+    )
+    return 0
+
+
 def cmd_inspect(args: argparse.Namespace) -> int:
     runs_dir = Path(args.runs_dir) if args.runs_dir else _default_runs_dir()
     state = load_state(args.run_id, runs_dir)
@@ -136,6 +159,27 @@ def build_parser() -> argparse.ArgumentParser:
         help="approve the plan gate before resuming",
     )
     resume.set_defaults(func=cmd_resume)
+
+    override = sub.add_parser(
+        "override",
+        help="mark a sub-agent step complete under human ownership (bypasses trace verify)",
+    )
+    override.add_argument("run_id")
+    override.add_argument(
+        "step",
+        choices=sorted(TRACED_STEPS),
+        help="which sub-agent gate to override",
+    )
+    override.add_argument(
+        "--reason",
+        required=True,
+        help="non-empty explanation (≥ 12 non-whitespace chars) recorded to the audit list",
+    )
+    override.add_argument(
+        "--operator",
+        help="identifier of the person applying the override (optional, recorded verbatim)",
+    )
+    override.set_defaults(func=cmd_override)
 
     inspect = sub.add_parser("inspect", help="print a run's current state as JSON")
     inspect.add_argument("run_id")

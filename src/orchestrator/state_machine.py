@@ -323,3 +323,63 @@ def record_human_plan_approval(state: RunState, notes: list[str] | None = None) 
     state.payload["plan"]["approved"] = True
     if notes:
         state.payload["plan"]["notes"] = notes
+
+
+class OverrideError(ValueError):
+    """Raised when a human override request is rejected."""
+
+
+def apply_human_override(
+    state: RunState,
+    step: str,
+    reason: str,
+    *,
+    operator: str | None = None,
+) -> dict:
+    """Mark ``step`` complete under a human override, bypassing trace verify.
+
+    - ``step`` must be a sub-agent gate (research / draft / review). The
+      human plan gate has its own ``record_human_plan_approval`` helper,
+      and ``finalize`` is deterministic.
+    - ``reason`` must be a non-trivial string (≥ 12 non-whitespace chars) —
+      a weak check against lazy ``"ok"``-style overrides.
+    - The override is **also** appended to ``payload.overrides`` as an
+      append-only audit list, so a later edit to ``payload.<step>`` cannot
+      erase the fact that an override was applied.
+
+    Returns the audit record that was appended.
+    """
+    if step not in TRACED_STEPS:
+        raise OverrideError(
+            f"override is only accepted for sub-agent gates ({sorted(TRACED_STEPS)}); "
+            f"got {step!r}"
+        )
+    if not isinstance(reason, str) or len(reason.strip()) < 12:
+        raise OverrideError(
+            "override reason must be a string of at least 12 non-whitespace characters"
+        )
+    if state.status == "completed":
+        raise OverrideError("cannot override: run is already completed")
+
+    step_payload = state.payload.setdefault(step, {})
+    step_payload["completed"] = True
+    step_payload["human_override_reason"] = reason.strip()
+
+    record = {
+        "step": step,
+        "reason": reason.strip(),
+        "operator": operator,
+        "applied_at": _now_iso(),
+    }
+    state.payload.setdefault("overrides", []).append(record)
+
+    _log.warning(
+        "human_override_applied",
+        extra={
+            "run_id": state.run_id,
+            "step": step,
+            "operator": operator,
+            "reason_length": len(reason.strip()),
+        },
+    )
+    return record
