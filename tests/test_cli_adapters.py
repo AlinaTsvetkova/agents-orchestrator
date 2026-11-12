@@ -21,6 +21,7 @@ from orchestrator.adapters import (  # noqa: E402
     build_adapter,
     build_prompt,
     MockAgent,
+    output_schema_for,
 )
 
 
@@ -108,6 +109,14 @@ class ClaudeCLIAdapterTests(unittest.TestCase):
         self.assertIn("--output-format", cmd)
         self.assertIn("json", cmd)
 
+    def test_claude_ignores_schema_path(self):
+        agent = ClaudeCLIAdapter()
+        cmd_without = agent.build_command("research", schema_path=None)
+        cmd_with = agent.build_command("research", schema_path="/tmp/schema.json")
+        # Claude has no --output-schema; schema_path is accepted but ignored.
+        self.assertEqual(cmd_without, cmd_with)
+        self.assertNotIn("--output-schema", cmd_with)
+
 
 class CodexCLIAdapterTests(unittest.TestCase):
     def test_parses_single_envelope(self):
@@ -144,6 +153,43 @@ class CodexCLIAdapterTests(unittest.TestCase):
         with mock.patch("subprocess.run", return_value=_completed(stdout="\n".join(events))):
             with self.assertRaises(CLIAdapterError):
                 agent.run("research", TASK)
+
+    def test_codex_passes_output_schema_file(self):
+        agent = CodexCLIAdapter()
+        body = {"completed": True, "findings": ["x"], "sources": []}
+        envelope = json.dumps({"last_message": body})
+        captured = {}
+
+        def fake_run(command, **kwargs):
+            captured["command"] = list(command)
+            # Verify --output-schema points at a real file whose contents
+            # equal the step's authoritative schema.
+            self.assertIn("--output-schema", command)
+            idx = command.index("--output-schema")
+            schema_path = Path(command[idx + 1])
+            self.assertTrue(schema_path.exists())
+            on_disk = json.loads(schema_path.read_text(encoding="utf-8"))
+            self.assertEqual(on_disk, output_schema_for("research"))
+            return _completed(stdout=envelope)
+
+        with mock.patch("subprocess.run", side_effect=fake_run):
+            output, _ = agent.run("research", TASK)
+        self.assertEqual(output, body)
+
+    def test_codex_schema_file_is_cleaned_up_after_run(self):
+        agent = CodexCLIAdapter()
+        envelope = json.dumps({"last_message": {"completed": True, "findings": [], "sources": []}})
+        schema_path_holder = {}
+
+        def fake_run(command, **kwargs):
+            idx = command.index("--output-schema")
+            schema_path_holder["path"] = command[idx + 1]
+            return _completed(stdout=envelope)
+
+        with mock.patch("subprocess.run", side_effect=fake_run):
+            agent.run("research", TASK)
+        # tempfile.NamedTemporaryFile with delete=True unlinks on context exit.
+        self.assertFalse(Path(schema_path_holder["path"]).exists())
 
 
 class BuildAdapterTests(unittest.TestCase):

@@ -25,8 +25,10 @@ from __future__ import annotations
 import hashlib
 import json
 import subprocess
+import tempfile
+from contextlib import contextmanager
 from datetime import datetime, timezone
-from typing import Any, Protocol
+from typing import Any, Iterator, Protocol
 
 from orchestrator.integrity import compute_trace, extract_traceable_output
 from orchestrator.structured_log import get_logger
@@ -114,6 +116,43 @@ _STEP_CONTRACTS: dict[str, str] = {
 }
 
 
+# JSON schemas for CLIs that support hard output constraints (e.g. Codex
+# ``--output-schema``). Claude Code does not have a direct equivalent, so
+# ClaudeCLIAdapter relies on ``_STEP_CONTRACTS`` embedded in the prompt only.
+_STEP_SCHEMAS: dict[str, dict] = {
+    "research": {
+        "type": "object",
+        "required": ["completed", "findings", "sources"],
+        "properties": {
+            "completed": {"type": "boolean"},
+            "findings": {"type": "array", "items": {"type": "string"}},
+            "sources": {"type": "array", "items": {"type": "string"}},
+        },
+        "additionalProperties": False,
+    },
+    "draft": {
+        "type": "object",
+        "required": ["completed", "body", "word_count"],
+        "properties": {
+            "completed": {"type": "boolean"},
+            "body": {"type": "string"},
+            "word_count": {"type": "integer"},
+        },
+        "additionalProperties": False,
+    },
+    "review": {
+        "type": "object",
+        "required": ["completed", "approved", "comments"],
+        "properties": {
+            "completed": {"type": "boolean"},
+            "approved": {"type": "boolean"},
+            "comments": {"type": "array", "items": {"type": "string"}},
+        },
+        "additionalProperties": False,
+    },
+}
+
+
 def build_prompt(step: str, task: dict) -> str:
     """Return a step-appropriate prompt that pins the required output shape."""
     contract = _STEP_CONTRACTS.get(step)
@@ -126,6 +165,14 @@ def build_prompt(step: str, task: dict) -> str:
         f"Produce the output for this step.\n{contract}\n"
         "Return only the JSON object, no prose."
     )
+
+
+def output_schema_for(step: str) -> dict:
+    """Return the JSON schema that hard-constrains output for ``step``."""
+    schema = _STEP_SCHEMAS.get(step)
+    if schema is None:
+        raise ValueError(f"no output schema for step {step!r}")
+    return schema
 
 
 # ---------------------------------------------------------------------------
@@ -211,28 +258,39 @@ class CLIAdapterBase:
         self.model = model
         self.timeout_seconds = timeout_seconds
 
-    def build_command(self, step: str) -> list[str]:  # pragma: no cover - abstract
+    def build_command(
+        self, step: str, *, schema_path: str | None = None
+    ) -> list[str]:  # pragma: no cover - abstract
         raise NotImplementedError
 
     def parse_envelope(self, stdout: str) -> dict:  # pragma: no cover - abstract
         raise NotImplementedError
 
+    @contextmanager
+    def _schema_path_for(self, step: str) -> Iterator[str | None]:
+        """Override in subclasses that enforce output via a schema file.
+
+        Base returns ``None`` — no hard enforcement, rely on the prompt.
+        """
+        yield None
+
     def run(self, step: str, task: dict) -> tuple[dict, str]:
         prompt = build_prompt(step, task)
-        command = self.build_command(step)
-        try:
-            result = subprocess.run(
-                command,
-                input=prompt,
-                text=True,
-                capture_output=True,
-                check=False,
-                timeout=self.timeout_seconds,
-            )
-        except subprocess.TimeoutExpired as error:
-            raise CLIAdapterError(
-                f"{self.adapter_name} CLI timed out after {self.timeout_seconds}s"
-            ) from error
+        with self._schema_path_for(step) as schema_path:
+            command = self.build_command(step, schema_path=schema_path)
+            try:
+                result = subprocess.run(
+                    command,
+                    input=prompt,
+                    text=True,
+                    capture_output=True,
+                    check=False,
+                    timeout=self.timeout_seconds,
+                )
+            except subprocess.TimeoutExpired as error:
+                raise CLIAdapterError(
+                    f"{self.adapter_name} CLI timed out after {self.timeout_seconds}s"
+                ) from error
 
         if result.returncode != 0:
             raise CLIAdapterError(
@@ -276,7 +334,11 @@ class ClaudeCLIAdapter(CLIAdapterBase):
     ) -> None:
         super().__init__(binary, model=model, timeout_seconds=timeout_seconds)
 
-    def build_command(self, step: str) -> list[str]:
+    def build_command(self, step: str, *, schema_path: str | None = None) -> list[str]:
+        # Claude Code has no direct --output-schema equivalent — we rely on
+        # the per-step contract in the prompt. ``schema_path`` is accepted
+        # for interface symmetry with CodexCLIAdapter but ignored.
+        _ = schema_path
         return [
             self.binary,
             "-p",
@@ -344,14 +406,28 @@ class CodexCLIAdapter(CLIAdapterBase):
     ) -> None:
         super().__init__(binary, model=model, timeout_seconds=timeout_seconds)
 
-    def build_command(self, step: str) -> list[str]:
-        return [
+    @contextmanager
+    def _schema_path_for(self, step: str) -> Iterator[str | None]:
+        """Materialise the step's JSON schema into a tempfile for --output-schema."""
+        schema = output_schema_for(step)
+        with tempfile.NamedTemporaryFile(
+            "w", suffix=".json", delete=True, encoding="utf-8"
+        ) as handle:
+            json.dump(schema, handle)
+            handle.flush()
+            yield handle.name
+
+    def build_command(self, step: str, *, schema_path: str | None = None) -> list[str]:
+        command = [
             self.binary,
             "exec",
             "--json",
             "--model",
             self.model,
         ]
+        if schema_path:
+            command.extend(["--output-schema", schema_path])
+        return command
 
     def parse_envelope(self, stdout: str) -> dict:
         # Try one-shot JSON first. Accept only if it looks like a result
