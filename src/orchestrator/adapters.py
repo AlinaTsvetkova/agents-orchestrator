@@ -1,12 +1,23 @@
 """Sub-agent adapters.
 
-A sub-agent takes a task plus a step name and returns a result dict plus
-the exact prompt that produced it. The orchestrator wraps every invocation
-in an invocation trace (see :mod:`orchestrator.integrity`) so the main
-gate can later verify the output was not forged.
+A sub-agent takes a step name and task dict, invokes some model, and returns
+the structured output plus the exact prompt that produced it. The orchestrator
+wraps every invocation in an invocation trace (see
+:mod:`orchestrator.integrity`) so the gate can later verify the output was
+not forged.
 
-``MockAgent`` is the default and only built-in adapter. ``ClaudeCLIAdapter``
-is sketched as a reference for wrapping a real subprocess-based CLI agent.
+Three adapters ship:
+
+- :class:`MockAgent` — deterministic, offline. Used by the demo CLI and tests.
+- :class:`ClaudeCLIAdapter` — subprocess wrapper around Anthropic's ``claude``
+  CLI with ``--output-format json``.
+- :class:`CodexCLIAdapter` — subprocess wrapper around OpenAI's ``codex exec``
+  CLI with ``--json`` output framing.
+
+Both CLI adapters share a :class:`CLIAdapterBase` that owns prompt construction,
+subprocess execution, timeout handling, and JSON parsing. A new provider only
+needs to override the two methods that describe its command line and output
+envelope.
 """
 
 from __future__ import annotations
@@ -32,6 +43,11 @@ def utc_now_iso() -> str:
     )
 
 
+# ---------------------------------------------------------------------------
+# Protocol + trace wrapper
+# ---------------------------------------------------------------------------
+
+
 class SubAgent(Protocol):
     """Protocol every sub-agent adapter must satisfy."""
 
@@ -41,9 +57,9 @@ class SubAgent(Protocol):
     def run(self, step: str, task: dict) -> tuple[dict, str]:
         """Return ``(output_dict, prompt_sent)``.
 
-        ``output_dict`` becomes the step payload, minus framework-managed
-        keys; the trace commits to it. ``prompt_sent`` is digested into
-        ``prompt_digest`` on the trace.
+        ``output_dict`` becomes the step payload (minus framework-managed
+        keys); the trace commits to its ``extract_traceable_output``. The
+        prompt is digested into ``prompt_digest`` on the trace.
         """
         ...
 
@@ -72,21 +88,53 @@ def run_with_trace(agent: SubAgent, step: str, task: dict) -> dict:
     output["_sub_agent_trace"] = trace
     _log.info(
         "agent_completed",
-        extra={
-            "adapter": agent.adapter_name,
-            "step": step,
-            "has_trace": True,
-        },
+        extra={"adapter": agent.adapter_name, "step": step, "has_trace": True},
     )
     return output
 
 
-class MockAgent:
-    """Deterministic, offline sub-agent used for tests and the demo CLI.
+# ---------------------------------------------------------------------------
+# Prompt builders
+# ---------------------------------------------------------------------------
 
-    The mock returns a plausible payload shape for each gate step so that
-    the whole workflow can be exercised without any external API calls.
-    """
+
+_STEP_CONTRACTS: dict[str, str] = {
+    "research": (
+        'Return a JSON object: {"completed": true, '
+        '"findings": [string, ...], "sources": [string, ...]}.'
+    ),
+    "draft": (
+        'Return a JSON object: {"completed": true, '
+        '"body": string, "word_count": integer}.'
+    ),
+    "review": (
+        'Return a JSON object: {"completed": true, '
+        '"approved": boolean, "comments": [string, ...]}.'
+    ),
+}
+
+
+def build_prompt(step: str, task: dict) -> str:
+    """Return a step-appropriate prompt that pins the required output shape."""
+    contract = _STEP_CONTRACTS.get(step)
+    if contract is None:
+        raise ValueError(f"no prompt contract for step {step!r}")
+    summary = task.get("summary", "<no summary provided>")
+    return (
+        f"You are the '{step}' sub-agent in a multi-agent workflow.\n"
+        f"Task: {summary}\n\n"
+        f"Produce the output for this step.\n{contract}\n"
+        "Return only the JSON object, no prose."
+    )
+
+
+# ---------------------------------------------------------------------------
+# Mock
+# ---------------------------------------------------------------------------
+
+
+class MockAgent:
+    """Deterministic, offline sub-agent used for tests and the demo CLI."""
 
     adapter_name = "mock"
 
@@ -104,10 +152,7 @@ class MockAgent:
             return (
                 {
                     "completed": True,
-                    "findings": [
-                        f"finding-{task_id}-1",
-                        f"finding-{task_id}-2",
-                    ],
+                    "findings": [f"finding-{task_id}-1", f"finding-{task_id}-2"],
                     "sources": [f"source://{task_id}"],
                 },
                 prompt,
@@ -133,26 +178,250 @@ class MockAgent:
         raise ValueError(f"mock agent has no behavior for step {step!r}")
 
 
-class ClaudeCLIAdapter:
-    """Example subprocess adapter around a hypothetical ``claude`` CLI.
+# ---------------------------------------------------------------------------
+# CLI adapter base
+# ---------------------------------------------------------------------------
 
-    Not wired into the default CLI — kept as a reference for integrators.
+
+class CLIAdapterError(RuntimeError):
+    """Raised when the underlying CLI fails or returns malformed output."""
+
+
+class CLIAdapterBase:
+    """Shared execution path for subprocess-based sub-agent CLIs.
+
+    Subclasses define three things:
+
+    - ``adapter_name`` and ``model`` (class or instance attributes).
+    - :meth:`build_command` — the argv list to run, including any flags.
+    - :meth:`parse_envelope` — how to pull the structured output out of
+      the CLI's stdout envelope.
+    """
+
+    adapter_name: str = "cli"
+
+    def __init__(
+        self,
+        binary: str,
+        *,
+        model: str,
+        timeout_seconds: int = 300,
+    ) -> None:
+        self.binary = binary
+        self.model = model
+        self.timeout_seconds = timeout_seconds
+
+    def build_command(self, step: str) -> list[str]:  # pragma: no cover - abstract
+        raise NotImplementedError
+
+    def parse_envelope(self, stdout: str) -> dict:  # pragma: no cover - abstract
+        raise NotImplementedError
+
+    def run(self, step: str, task: dict) -> tuple[dict, str]:
+        prompt = build_prompt(step, task)
+        command = self.build_command(step)
+        try:
+            result = subprocess.run(
+                command,
+                input=prompt,
+                text=True,
+                capture_output=True,
+                check=False,
+                timeout=self.timeout_seconds,
+            )
+        except subprocess.TimeoutExpired as error:
+            raise CLIAdapterError(
+                f"{self.adapter_name} CLI timed out after {self.timeout_seconds}s"
+            ) from error
+
+        if result.returncode != 0:
+            raise CLIAdapterError(
+                f"{self.adapter_name} CLI exited {result.returncode}: "
+                f"{result.stderr.strip() or result.stdout.strip() or '<no output>'}"
+            )
+
+        stdout = result.stdout.strip()
+        if not stdout:
+            raise CLIAdapterError(f"{self.adapter_name} CLI produced no stdout")
+
+        output = self.parse_envelope(stdout)
+        if not isinstance(output, dict):
+            raise CLIAdapterError(
+                f"{self.adapter_name} CLI output is not a JSON object: "
+                f"got {type(output).__name__}"
+            )
+        return output, prompt
+
+
+# ---------------------------------------------------------------------------
+# Claude
+# ---------------------------------------------------------------------------
+
+
+class ClaudeCLIAdapter(CLIAdapterBase):
+    """Wraps Anthropic's ``claude`` CLI invoked with ``--output-format json``.
+
+    The CLI prints an envelope containing a ``result`` field whose value is
+    a JSON string of the model's structured response.
     """
 
     adapter_name = "claude"
 
-    def __init__(self, binary: str = "claude", model: str = "claude-sonnet-4-6") -> None:
-        self.binary = binary
-        self.model = model
+    def __init__(
+        self,
+        binary: str = "claude",
+        *,
+        model: str = "claude-sonnet-4-6",
+        timeout_seconds: int = 300,
+    ) -> None:
+        super().__init__(binary, model=model, timeout_seconds=timeout_seconds)
 
-    def run(self, step: str, task: dict) -> tuple[dict, str]:
-        prompt = json.dumps({"step": step, "task": task}, sort_keys=True)
-        result = subprocess.run(
-            [self.binary, "--model", self.model, "--json"],
-            input=prompt,
-            text=True,
-            capture_output=True,
-            check=True,
-            timeout=300,
-        )
-        return json.loads(result.stdout), prompt
+    def build_command(self, step: str) -> list[str]:
+        return [
+            self.binary,
+            "-p",
+            "--model",
+            self.model,
+            "--output-format",
+            "json",
+        ]
+
+    def parse_envelope(self, stdout: str) -> dict:
+        try:
+            envelope: Any = json.loads(stdout)
+        except json.JSONDecodeError as error:
+            raise CLIAdapterError(
+                "claude CLI stdout was not valid JSON"
+            ) from error
+
+        if isinstance(envelope, list):
+            envelope = next(
+                (item for item in envelope if isinstance(item, dict) and item.get("type") == "result"),
+                None,
+            )
+            if envelope is None:
+                raise CLIAdapterError("claude CLI event stream had no 'result' event")
+
+        if not isinstance(envelope, dict):
+            raise CLIAdapterError("claude CLI envelope was not a JSON object")
+
+        if envelope.get("is_error"):
+            raise CLIAdapterError(f"claude CLI reported an error: {envelope.get('result')}")
+
+        result_text = envelope.get("result")
+        if not isinstance(result_text, str) or not result_text.strip():
+            raise CLIAdapterError("claude CLI envelope missing 'result' text")
+
+        try:
+            return json.loads(result_text)
+        except json.JSONDecodeError as error:
+            raise CLIAdapterError(
+                "claude CLI result text was not valid JSON"
+            ) from error
+
+
+# ---------------------------------------------------------------------------
+# Codex
+# ---------------------------------------------------------------------------
+
+
+class CodexCLIAdapter(CLIAdapterBase):
+    """Wraps OpenAI's ``codex exec`` CLI invoked with ``--json``.
+
+    The CLI emits either a single JSON object on stdout, or a newline-
+    delimited event stream whose final event carries the structured output
+    under ``last_message`` or ``result``. This adapter handles both shapes.
+    """
+
+    adapter_name = "codex"
+
+    def __init__(
+        self,
+        binary: str = "codex",
+        *,
+        model: str = "gpt-5-codex",
+        timeout_seconds: int = 300,
+    ) -> None:
+        super().__init__(binary, model=model, timeout_seconds=timeout_seconds)
+
+    def build_command(self, step: str) -> list[str]:
+        return [
+            self.binary,
+            "exec",
+            "--json",
+            "--model",
+            self.model,
+        ]
+
+    def parse_envelope(self, stdout: str) -> dict:
+        # Try one-shot JSON first. Accept only if it looks like a result
+        # envelope (otherwise it may be an intermediate event; fall through
+        # to the ndjson stream path).
+        envelope: Any = None
+        try:
+            candidate = json.loads(stdout)
+        except json.JSONDecodeError:
+            candidate = None
+        if isinstance(candidate, dict) and (
+            "last_message" in candidate or "result" in candidate or "completed" in candidate
+        ):
+            envelope = candidate
+
+        if envelope is None:
+            # Fallback: newline-delimited event stream.
+            events = []
+            for line in stdout.splitlines():
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    events.append(json.loads(line))
+                except json.JSONDecodeError:
+                    continue
+            envelope = next(
+                (
+                    event
+                    for event in reversed(events)
+                    if isinstance(event, dict) and ("last_message" in event or "result" in event)
+                ),
+                None,
+            )
+            if envelope is None:
+                raise CLIAdapterError("codex CLI stream had no result event")
+
+        if not isinstance(envelope, dict):
+            raise CLIAdapterError("codex CLI envelope was not a JSON object")
+
+        payload: Any = envelope.get("last_message") or envelope.get("result") or envelope
+        if isinstance(payload, str):
+            try:
+                payload = json.loads(payload)
+            except json.JSONDecodeError as error:
+                raise CLIAdapterError(
+                    "codex CLI result text was not valid JSON"
+                ) from error
+        if not isinstance(payload, dict):
+            raise CLIAdapterError(
+                "codex CLI result payload was not a JSON object"
+            )
+        return payload
+
+
+# ---------------------------------------------------------------------------
+# Factory
+# ---------------------------------------------------------------------------
+
+
+def build_adapter(name: str) -> SubAgent:
+    """Return an adapter instance for ``name``.
+
+    ``mock`` is always safe; ``claude`` and ``codex`` require the respective
+    binary to be installed and authenticated.
+    """
+    if name == "mock":
+        return MockAgent()
+    if name == "claude":
+        return ClaudeCLIAdapter()
+    if name == "codex":
+        return CodexCLIAdapter()
+    raise ValueError(f"unknown adapter: {name!r}")

@@ -7,7 +7,7 @@ import json
 import sys
 from pathlib import Path
 
-from orchestrator.adapters import MockAgent, run_with_trace
+from orchestrator.adapters import build_adapter, run_with_trace
 from orchestrator.state_machine import (
     STEP_SEQUENCE,
     TRACED_STEPS,
@@ -78,7 +78,7 @@ def cmd_run(args: argparse.Namespace) -> int:
     state = RunState.new(task)
     state.current_step = STEP_SEQUENCE[0]
     runs_dir = Path(args.runs_dir) if args.runs_dir else _default_runs_dir()
-    agent = MockAgent()
+    agent = build_adapter(args.adapter)
     _drive(state, runs_dir, auto_approve_plan=args.auto_plan, agent=agent)
     print(state.run_id)
     return 0
@@ -89,7 +89,7 @@ def cmd_resume(args: argparse.Namespace) -> int:
     state = load_state(args.run_id, runs_dir)
     if args.approve_plan:
         record_human_plan_approval(state, notes=["approved via orchestrator resume"])
-    agent = MockAgent()
+    agent = build_adapter(args.adapter)
     _drive(state, runs_dir, auto_approve_plan=False, agent=agent)
     return 0
 
@@ -110,6 +110,12 @@ def build_parser() -> argparse.ArgumentParser:
     run = sub.add_parser("run", help="start a new workflow run")
     run.add_argument("task", help="short summary of the task")
     run.add_argument(
+        "--adapter",
+        choices=("mock", "claude", "codex"),
+        default="mock",
+        help="sub-agent adapter to use (default: mock, offline deterministic)",
+    )
+    run.add_argument(
         "--auto-plan",
         action="store_true",
         help="auto-approve the plan gate (for demos and tests)",
@@ -118,6 +124,12 @@ def build_parser() -> argparse.ArgumentParser:
 
     resume = sub.add_parser("resume", help="resume a paused run")
     resume.add_argument("run_id")
+    resume.add_argument(
+        "--adapter",
+        choices=("mock", "claude", "codex"),
+        default="mock",
+        help="sub-agent adapter to use for remaining steps",
+    )
     resume.add_argument(
         "--approve-plan",
         action="store_true",
