@@ -1,5 +1,8 @@
 # agents-orchestrator
 
+[![tests](https://github.com/AlinaTsvetkova/agents-orchestrator/actions/workflows/tests.yml/badge.svg)](https://github.com/AlinaTsvetkova/agents-orchestrator/actions/workflows/tests.yml)
+[![license: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+
 A small reference implementation of a multi-agent workflow orchestrator with
 **cryptographic sub-agent verification**: the lead agent cannot forge the work
 of sub-agents by editing state files, because every sub-agent output is
