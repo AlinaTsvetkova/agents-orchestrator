@@ -1,0 +1,86 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "agents-orchestrator run state",
+  "type": "object",
+  "required": [
+    "run_id",
+    "task",
+    "payload",
+    "results",
+    "status",
+    "workflow_status",
+    "created_at",
+    "updated_at"
+  ],
+  "properties": {
+    "run_id": { "type": "string", "minLength": 1 },
+    "task": { "type": "object" },
+    "payload": {
+      "type": "object",
+      "additionalProperties": true,
+      "properties": {
+        "sub_agent_traces": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "object",
+            "required": [
+              "schema_version",
+              "step",
+              "adapter",
+              "model",
+              "timestamp",
+              "output_digest"
+            ],
+            "properties": {
+              "schema_version": { "type": "integer", "const": 1 },
+              "step": {
+                "type": "string",
+                "enum": ["research", "draft", "review"]
+              },
+              "adapter": {
+                "type": "string",
+                "enum": ["mock", "claude", "codex"]
+              },
+              "model": { "type": "string", "minLength": 1 },
+              "session_id": { "type": ["string", "null"] },
+              "timestamp": { "type": "string" },
+              "prompt_digest": {
+                "type": "string",
+                "pattern": "^sha256:[0-9a-f]{64}$"
+              },
+              "output_digest": {
+                "type": "string",
+                "pattern": "^(sha256|hmac-sha256):[0-9a-f]{64}$"
+              }
+            },
+            "additionalProperties": false
+          }
+        },
+        "sub_agent_trace_warnings": {
+          "type": "object",
+          "additionalProperties": { "type": "string" }
+        }
+      }
+    },
+    "results": { "type": "object" },
+    "current_step": { "type": ["string", "null"] },
+    "status": {
+      "type": "string",
+      "enum": ["pending", "running", "paused", "completed", "failed"]
+    },
+    "workflow_status": {
+      "type": "string",
+      "enum": [
+        "pending",
+        "running",
+        "agent_action_required",
+        "human_action_required",
+        "completed",
+        "failed"
+      ]
+    },
+    "created_at": { "type": "string" },
+    "updated_at": { "type": "string" }
+  },
+  "additionalProperties": false
+}
