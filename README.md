@@ -27,6 +27,63 @@ closes that gap: sub-agent adapters commit to their outputs with HMAC-signed
 invocation traces, and the orchestrator refuses to accept a step as complete
 unless the trace verifies against the current state payload.
 
+## How it works
+
+### Workflow state machine
+
+Five sequential steps. Each step's gate decides whether the orchestrator
+advances, asks the operator to intervene, or asks for a sub-agent run.
+
+```mermaid
+flowchart LR
+    start([run start]) --> plan
+    plan{"plan<br/>human gate"} -->|approved| research
+    plan -.->|awaiting approval| pause1([paused])
+    research["research<br/>sub-agent gate"] -->|trace verified| draft
+    research -.->|no trace / tampered| pause2([agent action required])
+    draft["draft<br/>sub-agent gate"] -->|trace verified| review
+    draft -.->|no trace / tampered| pause3([agent action required])
+    review["review<br/>sub-agent gate"] -->|trace verified| finalize
+    review -.->|no trace / tampered| pause4([agent action required])
+    finalize["finalize<br/>deterministic"] --> done([completed])
+```
+
+### Trust boundary in a single gate
+
+Honest path on top, forgery attempt on the bottom. The gate rejects a
+state that was not produced by a traced sub-agent invocation.
+
+```mermaid
+sequenceDiagram
+    participant Lead as Lead agent
+    participant State as Run state
+    participant Adapter as Sub-agent adapter
+    participant Gate as Orchestrator gate
+
+    rect rgb(235, 245, 235)
+    note over Lead,Gate: Honest path
+    Lead->>Adapter: invoke(step="research")
+    Adapter->>Adapter: run model
+    Adapter->>Adapter: compute_trace(output, HMAC)
+    Adapter-->>Lead: output + _sub_agent_trace
+    Lead->>State: write payload.research = output
+    Lead->>Gate: advance()
+    Gate->>State: read payload.research + trace
+    Gate->>Gate: verify output_digest
+    Gate-->>Lead: completed, advance to draft
+    end
+
+    rect rgb(250, 230, 230)
+    note over Lead,Gate: Forgery attempt
+    Lead->>State: write payload.research = {completed: true, ...}
+    note right of State: no sub-agent run,<br/>no trace recorded
+    Lead->>Gate: advance()
+    Gate->>State: read payload.research
+    Gate->>Gate: verify_trace -> TraceMismatch
+    Gate-->>Lead: agent_action_required<br/>reason=integrity_check_failed
+    end
+```
+
 ## Quickstart
 
 ```bash
