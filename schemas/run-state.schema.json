@@ -80,7 +80,17 @@
       ]
     },
     "created_at": { "type": "string" },
-    "updated_at": { "type": "string" }
+    "updated_at": { "type": "string" },
+    "failed_step": { "type": ["string", "null"] },
+    "last_error": {
+      "type": ["object", "null"],
+      "required": ["type", "message"],
+      "properties": {
+        "type": { "type": "string" },
+        "message": { "type": "string" }
+      },
+      "additionalProperties": true
+    }
   },
   "additionalProperties": false
 }

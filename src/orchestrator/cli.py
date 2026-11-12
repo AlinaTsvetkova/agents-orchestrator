@@ -16,6 +16,7 @@ from orchestrator.state_machine import (
     advance,
     apply_human_override,
     load_state,
+    mark_failed,
     record_human_plan_approval,
     record_sub_agent_output,
     save_state,
@@ -60,9 +61,35 @@ def _drive(state: RunState, runs_dir: Path, *, auto_approve_plan: bool, agent) -
                 print(f"unexpected sub-agent request at step {step}", file=sys.stderr)
                 return
             print(f"[run ] invoking {agent.adapter_name} for step {step}")
-            output = run_with_trace(agent, step, state.task)
+            try:
+                output = run_with_trace(agent, step, state.task)
+            except Exception as error:  # noqa: BLE001 — adapter errors become run-level failures
+                mark_failed(state, step, error)
+                save_state(state, runs_dir)
+                print(
+                    f"[fail] {step}: {type(error).__name__}: {error}",
+                    file=sys.stderr,
+                )
+                print(
+                    f"       resume with: orchestrator resume {state.run_id}",
+                    file=sys.stderr,
+                )
+                return
             record_sub_agent_output(state, step, output)
             continue
+
+        if status == "failed":
+            last = (next_action or {}).get("last_error") or {}
+            print(
+                f"[fail] run {state.run_id} is in a failed state at '{step}': "
+                f"{last.get('type', '?')}: {last.get('message', '?')}",
+                file=sys.stderr,
+            )
+            print(
+                f"       resume with: orchestrator resume {state.run_id}",
+                file=sys.stderr,
+            )
+            return
 
         if status == "human_action_required" and step == "plan":
             if auto_approve_plan:
@@ -152,6 +179,11 @@ def _format_summary(state: RunState) -> str:
         f"Created:   {state.created_at}",
         f"Updated:   {state.updated_at}",
     ]
+    if state.status == "failed" and state.last_error:
+        lines.append(
+            f"Error:     at '{state.failed_step}' — "
+            f"{state.last_error.get('type')}: {state.last_error.get('message')}"
+        )
     return "\n".join(lines)
 
 

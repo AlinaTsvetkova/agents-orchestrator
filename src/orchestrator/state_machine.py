@@ -23,6 +23,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+import jsonschema
+
 from orchestrator.integrity import (
     TraceMismatch,
     extract_traceable_output,
@@ -37,6 +39,18 @@ STEP_SEQUENCE: tuple[str, ...] = ("plan", "research", "draft", "review", "finali
 
 # Steps where the main-agent gate verifies a sub-agent invocation trace.
 TRACED_STEPS = frozenset({"research", "draft", "review"})
+
+# Shipped alongside the package so the orchestrator can validate run-state
+# files on load even when installed outside its source tree.
+_SCHEMA_PATH = Path(__file__).resolve().parents[2] / "schemas" / "run-state.schema.json"
+
+
+class StateFileCorrupted(ValueError):
+    """Raised when a run-state file does not match run-state.schema.json."""
+
+
+def _load_schema() -> dict:
+    return json.loads(_SCHEMA_PATH.read_text(encoding="utf-8"))
 
 
 # ---------------------------------------------------------------------------
@@ -55,6 +69,8 @@ class RunState:
     workflow_status: str = "pending"
     created_at: str = ""
     updated_at: str = ""
+    failed_step: str | None = None
+    last_error: dict | None = None
 
     @classmethod
     def new(cls, task: dict) -> "RunState":
@@ -77,6 +93,8 @@ class RunState:
             "workflow_status": self.workflow_status,
             "created_at": self.created_at,
             "updated_at": self.updated_at,
+            "failed_step": self.failed_step,
+            "last_error": self.last_error,
         }
 
     @classmethod
@@ -117,8 +135,22 @@ def save_state(state: RunState, runs_dir: Path) -> Path:
 
 def load_state(run_id: str, runs_dir: Path) -> RunState:
     path = runs_dir / f"{run_id}.json"
-    data = json.loads(path.read_text(encoding="utf-8"))
-    return RunState.from_json(data)
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as error:
+        raise StateFileCorrupted(f"{path.name} is not valid JSON: {error}") from error
+    try:
+        jsonschema.validate(data, _load_schema())
+    except jsonschema.ValidationError as error:
+        raise StateFileCorrupted(
+            f"{path.name} does not match run-state.schema.json: {error.message}"
+        ) from error
+    try:
+        return RunState.from_json(data)
+    except TypeError as error:
+        raise StateFileCorrupted(
+            f"{path.name} contains fields unknown to RunState: {error}"
+        ) from error
 
 
 # ---------------------------------------------------------------------------
@@ -268,18 +300,57 @@ def _next_step(current: str) -> str | None:
 # ---------------------------------------------------------------------------
 
 
+def mark_failed(state: RunState, step: str, error: Exception) -> dict:
+    """Transition ``state`` to a failed terminal pause at ``step``.
+
+    ``last_error`` records a small structured envelope (type + message) so
+    an operator can diagnose from state alone without correlating to logs.
+    """
+    error_record = {"type": type(error).__name__, "message": str(error)}
+    state.status = "failed"
+    state.workflow_status = "failed"
+    state.failed_step = step
+    state.last_error = error_record
+    _log.error(
+        "run_failed",
+        extra={
+            "run_id": state.run_id,
+            "failed_step": step,
+            "error_type": error_record["type"],
+        },
+    )
+    return {
+        "workflow_status": "failed",
+        "next_action": {
+            "type": "restart_failed_step",
+            "step": step,
+            "last_error": error_record,
+        },
+    }
+
+
 def advance(state: RunState) -> dict:
     """Run one pass of the state machine from ``state.current_step``.
 
     Stops at the first gate that is not satisfied. The caller is expected
     to supply the next sub-agent output / human decision, persist, and
-    call ``advance`` again.
+    call ``advance`` again. Any exception raised inside a gate implementation
+    is captured — the run transitions to ``failed`` and can be resumed.
     """
     step = state.current_step or STEP_SEQUENCE[0]
     state.current_step = step
+    # A previous failure is considered cleared the moment a resume reaches
+    # this point; the gate re-executes and will either pass or fail again.
+    if state.status == "failed":
+        state.failed_step = None
+        state.last_error = None
     state.status = "running"
 
-    gate_result = check_gate(state, step)
+    try:
+        gate_result = check_gate(state, step)
+    except Exception as error:  # noqa: BLE001 — convert any gate failure to a failed transition
+        return mark_failed(state, step, error)
+
     state.results[step] = gate_result
     handoff = determine_handoff(state, gate_result, step)
     _log.info(
