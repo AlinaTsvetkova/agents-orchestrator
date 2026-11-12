@@ -228,7 +228,8 @@ validation.
 
 ## Status
 
-Reference implementation. The orchestration and verification primitives are
+Reference implementation. See [CHANGELOG.md](CHANGELOG.md) for versioned
+release notes. The orchestration and verification primitives are
 deliberately thin — the goal is to be a clear argument for a trust-boundary
 pattern that production multi-agent frameworks could adopt, not a production
 workflow engine.
