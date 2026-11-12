@@ -61,5 +61,47 @@ class CliE2ETests(unittest.TestCase):
         self.assertEqual(state_after.status, "completed")
 
 
+class CliInspectSummaryTests(unittest.TestCase):
+    def setUp(self):
+        os.environ.pop("ORCHESTRATOR_STRICT_INTEGRITY", None)
+        self._tmp = tempfile.TemporaryDirectory()
+        self.runs = Path(self._tmp.name)
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def test_summary_after_completed_run(self):
+        main(["--runs-dir", str(self.runs), "run", "--auto-plan", "demo"])
+        state_path = next(self.runs.glob("*.json"))
+        run_id = state_path.stem
+
+        import io
+        from contextlib import redirect_stdout
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            rc = main(["--runs-dir", str(self.runs), "inspect", run_id])
+        self.assertEqual(rc, 0)
+        summary = buf.getvalue()
+        self.assertIn("Status:    completed", summary)
+        self.assertIn("5/5 steps completed", summary)
+        self.assertIn("3 verified", summary)
+        self.assertIn("plan, research, draft, review, finalize", summary)
+
+    def test_json_mode_still_available(self):
+        main(["--runs-dir", str(self.runs), "run", "--auto-plan", "demo"])
+        state_path = next(self.runs.glob("*.json"))
+        run_id = state_path.stem
+
+        import io
+        from contextlib import redirect_stdout
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            rc = main(["--runs-dir", str(self.runs), "inspect", run_id, "--json"])
+        self.assertEqual(rc, 0)
+        data = json.loads(buf.getvalue())
+        self.assertEqual(data["run_id"], run_id)
+        self.assertEqual(data["status"], "completed")
+
+
 if __name__ == "__main__":
     unittest.main()

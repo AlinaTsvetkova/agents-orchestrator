@@ -33,18 +33,23 @@ def _drive(state: RunState, runs_dir: Path, *, auto_approve_plan: bool, agent) -
     human plan-approval gate is satisfied with ``auto_approve_plan`` when
     requested (demo mode); otherwise the run stops and asks the operator.
     """
+    last_announced_step: str | None = None
     while True:
+        step_before_advance = state.current_step
         handoff = advance(state)
         save_state(state, runs_dir)
         status = handoff["workflow_status"]
 
         if status == "completed":
-            print(f"run {state.run_id} completed")
+            print(f"[done] run {state.run_id} completed")
             return
 
         if status == "running":
-            # Gate passed; advance() has moved current_step forward. Loop to
-            # exercise the next step's gate.
+            next_step = (handoff["next_action"] or {}).get("step")
+            if next_step and next_step != last_announced_step:
+                print(f"[pass] {step_before_advance} -> advancing to {next_step}")
+                last_announced_step = next_step
+            # Loop to exercise the next step's gate.
             continue
 
         next_action = handoff["next_action"] or {}
@@ -54,22 +59,24 @@ def _drive(state: RunState, runs_dir: Path, *, auto_approve_plan: bool, agent) -
             if step not in TRACED_STEPS:
                 print(f"unexpected sub-agent request at step {step}", file=sys.stderr)
                 return
+            print(f"[run ] invoking {agent.adapter_name} for step {step}")
             output = run_with_trace(agent, step, state.task)
             record_sub_agent_output(state, step, output)
             continue
 
         if status == "human_action_required" and step == "plan":
             if auto_approve_plan:
+                print("[auto] auto-approving plan gate")
                 record_human_plan_approval(state, notes=["auto-approved by --auto-plan"])
                 continue
             print(
-                f"run {state.run_id} is paused at step 'plan'. "
-                f"Approve the plan and resume with: orchestrator resume {state.run_id}",
+                f"[wait] run {state.run_id} paused at 'plan'. "
+                f"Approve and resume with: orchestrator resume --approve-plan {state.run_id}"
             )
             return
 
         print(
-            f"run {state.run_id} paused: workflow_status={status} step={step}",
+            f"[warn] run {state.run_id} paused: workflow_status={status} step={step}",
             file=sys.stderr,
         )
         return
@@ -117,11 +124,45 @@ def cmd_override(args: argparse.Namespace) -> int:
     return 0
 
 
+def _format_summary(state: RunState) -> str:
+    """Human-readable one-screen summary of a run."""
+    completed_steps = [
+        step
+        for step in STEP_SEQUENCE
+        if isinstance(state.results.get(step), dict)
+        and state.results[step].get("status") == "completed"
+    ]
+    traces = state.payload.get("sub_agent_traces", {}) or {}
+    overrides = state.payload.get("overrides", []) or []
+    warnings = state.payload.get("sub_agent_trace_warnings", {}) or {}
+
+    lines = [
+        f"Run:       {state.run_id}",
+        f"Task:      {state.task.get('summary', '<unset>')}",
+        f"Status:    {state.status}  (workflow_status={state.workflow_status})",
+        f"Current:   {state.current_step or '<unset>'}",
+        f"Progress:  {len(completed_steps)}/{len(STEP_SEQUENCE)} steps "
+        f"completed ({', '.join(completed_steps) or '<none>'})",
+        f"Traces:    {len(traces)} verified"
+        + (f" ({', '.join(sorted(traces))})" if traces else ""),
+        f"Overrides: {len(overrides)}"
+        + (f" ({', '.join(r['step'] for r in overrides)})" if overrides else ""),
+        f"Warnings:  {len(warnings)}"
+        + (f" ({', '.join(sorted(warnings))})" if warnings else ""),
+        f"Created:   {state.created_at}",
+        f"Updated:   {state.updated_at}",
+    ]
+    return "\n".join(lines)
+
+
 def cmd_inspect(args: argparse.Namespace) -> int:
     runs_dir = Path(args.runs_dir) if args.runs_dir else _default_runs_dir()
     state = load_state(args.run_id, runs_dir)
-    json.dump(state.to_json(), sys.stdout, indent=2, sort_keys=True)
-    sys.stdout.write("\n")
+    if args.json:
+        json.dump(state.to_json(), sys.stdout, indent=2, sort_keys=True)
+        sys.stdout.write("\n")
+    else:
+        print(_format_summary(state))
     return 0
 
 
@@ -181,8 +222,13 @@ def build_parser() -> argparse.ArgumentParser:
     )
     override.set_defaults(func=cmd_override)
 
-    inspect = sub.add_parser("inspect", help="print a run's current state as JSON")
+    inspect = sub.add_parser("inspect", help="print a summary of a run's current state")
     inspect.add_argument("run_id")
+    inspect.add_argument(
+        "--json",
+        action="store_true",
+        help="emit the full run-state JSON instead of the summary",
+    )
     inspect.set_defaults(func=cmd_inspect)
 
     return parser

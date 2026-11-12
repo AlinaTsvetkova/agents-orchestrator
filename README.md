@@ -106,6 +106,66 @@ approval. Resume with:
 orchestrator resume --approve-plan <run-id>
 ```
 
+Inspect a run's current state:
+
+```bash
+orchestrator inspect <run-id>
+# Run:       <uuid>
+# Task:      write a short note on HMAC vs plain hashing
+# Status:    completed  (workflow_status=completed)
+# Progress:  5/5 steps completed (plan, research, draft, review, finalize)
+# Traces:    3 verified (draft, research, review)
+# Overrides: 0
+# Warnings:  0
+
+orchestrator inspect <run-id> --json    # full state as JSON
+```
+
+## Using with real agents
+
+The default `mock` adapter is offline and deterministic; use it for tests,
+demos, and development. For real inference, select a CLI adapter:
+
+```bash
+# Anthropic Claude Code (requires `claude` binary and ANTHROPIC_API_KEY)
+orchestrator run --adapter claude --auto-plan "<task>"
+
+# OpenAI Codex CLI (requires `codex` binary and OPENAI_API_KEY)
+orchestrator run --adapter codex --auto-plan "<task>"
+```
+
+The two providers enforce output structure differently:
+
+- **Codex** supports `--output-schema <path>`; the adapter materialises the
+  per-step JSON schema into a temp file and lets the CLI constrain the
+  model's response at the API boundary. This is **hard** enforcement.
+- **Claude Code** has no direct equivalent, so the adapter relies on the
+  prompt contract (`_STEP_CONTRACTS`) only. This is **soft** enforcement —
+  the adapter raises `CLIAdapterError` if the returned JSON doesn't parse,
+  but the model could in principle return extra fields that still parse.
+
+In production, set `ORCHESTRATOR_TRACE_SECRET` in the adapter's environment
+so traces are HMAC-signed. The secret must not be readable by the lead-agent
+process; otherwise the integrity layer degrades from tamper-proof to
+tamper-evident.
+
+## Human overrides
+
+When a sub-agent is unavailable (API outage, upstream degradation), an
+operator can take manual ownership of a gate:
+
+```bash
+orchestrator override <run-id> research \
+    --reason "ran the research step manually against incident-472" \
+    --operator alice
+orchestrator resume <run-id>
+```
+
+The override is recorded on both the step payload and an append-only
+`payload.overrides` audit list, so a later edit cannot erase the fact it
+happened. Reason strings shorter than 12 non-whitespace characters are
+rejected — a weak but effective guard against lazy `"ok"` overrides.
+
 ## What the state machine does
 
 Five steps, three sub-agent gates, one human gate:
